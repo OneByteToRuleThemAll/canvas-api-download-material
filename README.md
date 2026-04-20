@@ -124,12 +124,3 @@ canvas-material sync-course 12345
 ## Canvas token note
 
 Most Canvas instances let users create an access token from the account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`.
-
-## Next steps
-
-- Download pages and announcements
-- Preserve Canvas folder structure instead of flattening files per course
-- Export module content as Markdown for easier offline browsing
-- Add filters for term, course code, or include/exclude lists
-- Improve offline rewriting for non-Canvas assets
-- Add broader integration tests against mocked Canvas API responses
