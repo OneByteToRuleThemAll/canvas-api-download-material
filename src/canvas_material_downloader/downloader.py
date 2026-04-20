@@ -99,6 +99,7 @@ class CanvasMaterialDownloader:
             course_name=course_name,
             course_dir=course_root,
         )
+        modules: list[dict[str, Any]] | None = None
 
         if include_modules:
             try:
@@ -128,7 +129,7 @@ class CanvasMaterialDownloader:
                 )
 
         if include_files:
-            summary = self._sync_course_files(course_id, course_root, summary)
+            summary = self._sync_course_files(course_id, course_root, summary, modules=modules)
 
         return summary
 
@@ -137,24 +138,34 @@ class CanvasMaterialDownloader:
         course_id: int,
         course_root: Path,
         summary: CourseSyncSummary,
+        *,
+        modules: list[dict[str, Any]] | None = None,
     ) -> CourseSyncSummary:
+        file_source = "course_files"
+        warning: str | None = None
         try:
             files = self.client.list_course_files(course_id)
         except CanvasApiError as exc:
             if not _is_authorization_error(exc):
                 raise
 
-            summary.issues.append(_format_issue("files", exc))
-            _write_json(
-                course_root / "files.json",
-                {
-                    "course_id": course_id,
-                    "synced_at": _utc_now_iso(),
-                    "files": [],
-                    "error": str(exc),
-                },
-            )
-            return summary
+            files = self._list_module_linked_files(course_id, modules=modules)
+            if files is None:
+                summary.issues.append(_format_issue("files", exc))
+                _write_json(
+                    course_root / "files.json",
+                    {
+                        "course_id": course_id,
+                        "synced_at": _utc_now_iso(),
+                        "files": [],
+                        "error": str(exc),
+                    },
+                )
+                return summary
+
+            file_source = "module_file_fallback"
+            warning = "Course file listing was denied, so only files referenced in modules were synced."
+            summary.issues.append("files: used module fallback")
 
         files_dir = course_root / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
@@ -225,13 +236,17 @@ class CanvasMaterialDownloader:
             )
 
         summary.files_total = len(files)
+        payload: dict[str, Any] = {
+            "course_id": course_id,
+            "synced_at": _utc_now_iso(),
+            "files": manifest_entries,
+            "source": file_source,
+        }
+        if warning:
+            payload["warning"] = warning
         _write_json(
             course_root / "files.json",
-            {
-                "course_id": course_id,
-                "synced_at": _utc_now_iso(),
-                "files": manifest_entries,
-            },
+            payload,
         )
         return summary
 
@@ -251,6 +266,55 @@ class CanvasMaterialDownloader:
         if error:
             entry["error"] = error
         return entry
+
+    def _list_module_linked_files(
+        self,
+        course_id: int,
+        *,
+        modules: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        module_records = modules
+        if module_records is None:
+            try:
+                module_records = self.client.list_course_modules(course_id)
+            except CanvasApiError as exc:
+                if _is_authorization_error(exc):
+                    return None
+                raise
+
+        seen_file_ids: set[int] = set()
+        fallback_files: list[dict[str, Any]] = []
+
+        for module in module_records:
+            items = module.get("items")
+            if not isinstance(items, list):
+                continue
+
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "File":
+                    continue
+
+                content_id = item.get("content_id")
+                if content_id is None:
+                    continue
+
+                try:
+                    file_id = int(content_id)
+                except (TypeError, ValueError):
+                    continue
+
+                if file_id in seen_file_ids:
+                    continue
+
+                seen_file_ids.add(file_id)
+                fallback_files.append(
+                    {
+                        "id": file_id,
+                        "display_name": item.get("title") or f"File {file_id}",
+                    }
+                )
+
+        return fallback_files
 
 
 def _load_existing_file_manifest(path: Path) -> dict[str, dict[str, Any]]:
