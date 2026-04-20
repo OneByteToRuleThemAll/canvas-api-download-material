@@ -17,6 +17,19 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 class CanvasApiError(RuntimeError):
     """Raised when the Canvas API returns an error or invalid response."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.url = url
+        self.detail = detail
+
 
 class CanvasClient:
     def __init__(self, settings: Settings, *, max_retries: int = 3) -> None:
@@ -142,6 +155,9 @@ class CanvasClient:
                 if exc.code == 401:
                     raise CanvasApiError(
                         "Canvas rejected the access token with HTTP 401. Check CANVAS_ACCESS_TOKEN."
+                        ,
+                        status_code=exc.code,
+                        url=request.full_url,
                     ) from exc
 
                 if exc.code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
@@ -149,12 +165,20 @@ class CanvasClient:
                     continue
 
                 detail = _read_http_error_body(exc)
-                raise CanvasApiError(f"Canvas request failed with HTTP {exc.code}: {detail}") from exc
+                raise CanvasApiError(
+                    f"Canvas request failed with HTTP {exc.code}: {detail}",
+                    status_code=exc.code,
+                    url=request.full_url,
+                    detail=detail,
+                ) from exc
             except urllib.error.URLError as exc:
                 if attempt < self.max_retries:
                     time.sleep(self._retry_delay(attempt, None))
                     continue
-                raise CanvasApiError(f"Canvas request failed: {exc.reason}") from exc
+                raise CanvasApiError(
+                    f"Canvas request failed: {exc.reason}",
+                    url=request.full_url,
+                ) from exc
 
         raise CanvasApiError("Canvas request failed after repeated retries.")
 
@@ -193,4 +217,3 @@ def _read_http_error_body(error: urllib.error.HTTPError) -> str:
     except Exception:
         body = ""
     return body or "no additional detail returned"
-

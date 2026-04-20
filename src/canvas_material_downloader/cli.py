@@ -103,7 +103,7 @@ def _run_list_courses(downloader: CanvasMaterialDownloader, *, include_concluded
 
 
 def _print_sync_summary(summary: CourseSyncSummary) -> None:
-    print(
+    line = (
         f"[{summary.course_id}] {summary.course_name} -> "
         f"downloaded={summary.files_downloaded}, "
         f"skipped={summary.files_skipped}, "
@@ -111,6 +111,9 @@ def _print_sync_summary(summary: CourseSyncSummary) -> None:
         f"modules={summary.modules_total}, "
         f"path={summary.course_dir}"
     )
+    if summary.issues:
+        line = f"{line}, issues={'; '.join(summary.issues)}"
+    print(line)
 
 
 def _print_totals(summaries: list[CourseSyncSummary]) -> None:
@@ -119,9 +122,10 @@ def _print_totals(summaries: list[CourseSyncSummary]) -> None:
     total_downloaded = sum(summary.files_downloaded for summary in summaries)
     total_skipped = sum(summary.files_skipped for summary in summaries)
     total_errors = sum(summary.file_errors for summary in summaries)
+    total_issues = sum(len(summary.issues) for summary in summaries)
 
     print(
         f"Totals -> courses={total_courses}, files={total_files}, "
-        f"downloaded={total_downloaded}, skipped={total_skipped}, errors={total_errors}"
+        f"downloaded={total_downloaded}, skipped={total_skipped}, "
+        f"errors={total_errors}, issues={total_issues}"
     )
-

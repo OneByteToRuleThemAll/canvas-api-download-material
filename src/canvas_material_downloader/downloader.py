@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ class CourseSyncSummary:
     files_skipped: int = 0
     file_errors: int = 0
     modules_total: int = 0
+    issues: list[str] = field(default_factory=list)
 
 
 class CanvasMaterialDownloader:
@@ -38,7 +39,16 @@ class CanvasMaterialDownloader:
         include_files: bool = True,
         include_modules: bool = True,
     ) -> CourseSyncSummary:
-        course = self.client.get_course(course_id)
+        try:
+            course = self.client.get_course(course_id)
+        except CanvasApiError as exc:
+            if not _is_authorization_error(exc):
+                raise
+
+            course = self._find_visible_course(course_id)
+            if course is None:
+                raise
+
         return self._sync_course_record(
             course,
             include_files=include_files,
@@ -63,6 +73,13 @@ class CanvasMaterialDownloader:
             )
         return summaries
 
+    def _find_visible_course(self, course_id: int) -> dict[str, Any] | None:
+        for include_concluded in (False, True):
+            for course in self.client.list_courses(include_concluded=include_concluded):
+                if int(course.get("id", -1)) == course_id:
+                    return course
+        return None
+
     def _sync_course_record(
         self,
         course: dict[str, Any],
@@ -84,16 +101,31 @@ class CanvasMaterialDownloader:
         )
 
         if include_modules:
-            modules = self.client.list_course_modules(course_id)
-            summary.modules_total = len(modules)
-            _write_json(
-                course_root / "modules.json",
-                {
-                    "course_id": course_id,
-                    "synced_at": _utc_now_iso(),
-                    "modules": modules,
-                },
-            )
+            try:
+                modules = self.client.list_course_modules(course_id)
+                summary.modules_total = len(modules)
+                _write_json(
+                    course_root / "modules.json",
+                    {
+                        "course_id": course_id,
+                        "synced_at": _utc_now_iso(),
+                        "modules": modules,
+                    },
+                )
+            except CanvasApiError as exc:
+                if not _is_authorization_error(exc):
+                    raise
+
+                summary.issues.append(_format_issue("modules", exc))
+                _write_json(
+                    course_root / "modules.json",
+                    {
+                        "course_id": course_id,
+                        "synced_at": _utc_now_iso(),
+                        "modules": [],
+                        "error": str(exc),
+                    },
+                )
 
         if include_files:
             summary = self._sync_course_files(course_id, course_root, summary)
@@ -106,7 +138,24 @@ class CanvasMaterialDownloader:
         course_root: Path,
         summary: CourseSyncSummary,
     ) -> CourseSyncSummary:
-        files = self.client.list_course_files(course_id)
+        try:
+            files = self.client.list_course_files(course_id)
+        except CanvasApiError as exc:
+            if not _is_authorization_error(exc):
+                raise
+
+            summary.issues.append(_format_issue("files", exc))
+            _write_json(
+                course_root / "files.json",
+                {
+                    "course_id": course_id,
+                    "synced_at": _utc_now_iso(),
+                    "files": [],
+                    "error": str(exc),
+                },
+            )
+            return summary
+
         files_dir = course_root / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
 
@@ -121,8 +170,21 @@ class CanvasMaterialDownloader:
 
             download_url = file_data.get("url")
             if not download_url:
-                file_data = self.client.get_file(file_id)
-                download_url = file_data.get("url")
+                try:
+                    file_data = self.client.get_file(file_id)
+                    download_url = file_data.get("url")
+                except CanvasApiError as exc:
+                    summary.file_errors += 1
+                    manifest_entries.append(
+                        self._file_manifest_entry(
+                            file_data,
+                            course_root=course_root,
+                            destination=destination,
+                            status="error",
+                            error=str(exc),
+                        )
+                    )
+                    continue
 
             if not download_url:
                 summary.file_errors += 1
@@ -232,3 +294,12 @@ def _write_json(path: Path, payload: Any) -> None:
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+def _is_authorization_error(error: CanvasApiError) -> bool:
+    return error.status_code in {401, 403}
+
+
+def _format_issue(resource_name: str, error: CanvasApiError) -> str:
+    if error.status_code is None:
+        return f"{resource_name}: {error}"
+    return f"{resource_name}: HTTP {error.status_code}"
