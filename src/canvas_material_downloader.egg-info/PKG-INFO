@@ -5,20 +5,31 @@ Summary: CLI foundation for downloading course material from Canvas.
 Author: matty
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
+Requires-Dist: tqdm<5,>=4.66
 
 # Canvas Material Downloader
 
-This repository is a Python foundation for pulling course material out of Canvas and storing it in one local place for students.
+Small Python CLI for exporting student-visible course content from Canvas into one local folder.
 
-The initial scaffold focuses on a clean CLI, environment-based configuration, Canvas API pagination, and downloading course files with per-course manifests. It also stores module metadata so the project can grow into pages, assignments, announcements, and richer exports later.
+The project is built around the Canvas REST API and is meant to be a practical foundation rather than a finished archival system. It already handles a few messy real-world cases, including paginated endpoints, denied course-wide file listings, and per-course manifests.
 
-## What it does today
+## Current scope
 
-- Lists the Canvas courses available to the authenticated user
-- Syncs one course or all visible courses
-- Downloads course files into a local `downloads/` directory
-- Stores `course.json`, `files.json`, and `modules.json` metadata per course
-- Skips re-downloading unchanged files when size and `updated_at` still match
+- List the Canvas courses available to the authenticated user
+- Sync one course or all visible courses
+- Run `sync-all` in parallel with live course progress output
+- Save per-course metadata as `course.json`, `modules.json`, `assignments.json`, and `files.json`
+- Export each assignment to a local HTML file
+- Download Canvas-hosted files linked inside assignment descriptions when they are still accessible
+- Download course files into a local `downloads/` directory
+- Skip re-downloading unchanged files when `size` and `updated_at` still match
+
+## Important limitations
+
+- Some Canvas instances deny the course-wide files endpoint. When that happens, the downloader falls back to files referenced inside modules only.
+- Concluded or locked courses may still expose metadata while hiding the actual file or assignment material. In those cases you may get assignment HTML and manifests, but not the linked files.
+- External links in assignments, such as Google Colab, Kaggle, Hugging Face, or arbitrary websites, are preserved in the exported HTML but are not mirrored locally.
+- If a linked Canvas file no longer exists or is no longer visible to the current token, the manifest will record the error.
 
 ## Project layout
 
@@ -36,12 +47,18 @@ Downloaded content is written like this:
 ```text
 downloads/
 └── 12345 - CS101 - Intro to Biology/
+    ├── assignments/
+    │   ├── 4567 - Essay 1.html
+    │   └── materials/
+    │       └── 4567/
+    │           └── 99870 - project-brief.pdf
+    ├── assignments.json
     ├── course.json
+    ├── files/
+    │   ├── 99881 - Syllabus.pdf
+    │   └── 99882 - Week 01 Slides.pdf
     ├── files.json
-    ├── modules.json
-    └── files/
-        ├── 99881 - Syllabus.pdf
-        └── 99882 - Week 01 Slides.pdf
+    └── modules.json
 ```
 
 ## Setup
@@ -87,28 +104,40 @@ Sync every available course:
 python -m canvas_material_downloader sync-all
 ```
 
-Include concluded courses too:
+Control how many courses run in parallel:
+
+```powershell
+python -m canvas_material_downloader sync-all --parallelism 6
+```
+
+Include concluded courses:
 
 ```powershell
 python -m canvas_material_downloader sync-all --include-concluded
 ```
 
-Skip files or modules when you only want part of the sync:
+Skip specific parts of the sync:
 
 ```powershell
+python -m canvas_material_downloader sync-course 12345 --skip-assignments
 python -m canvas_material_downloader sync-course 12345 --skip-files
 python -m canvas_material_downloader sync-course 12345 --skip-modules
 ```
 
+After installation you can also use the console script:
+
+```powershell
+canvas-material sync-course 12345
+```
+
+## What to expect in practice
+
+- `modules.json` is often the most reliable source of structure and file references.
+- `files.json` may come either from the course files endpoint or from the module-file fallback path.
+- `assignments.json` may contain assignment metadata even when the linked materials are no longer downloadable.
+- Exported assignment HTML is mainly an offline snapshot of the assignment instructions plus any local rewrites for Canvas-hosted file links that were successfully downloaded.
+- `sync-all` shows a live overall progress bar and prints each course summary as it completes.
+
 ## Canvas token note
 
-Most Canvas instances let users create an access token from their account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`.
-
-## Good next steps
-
-- Download pages, assignments, and announcements in addition to files
-- Preserve Canvas folder structure instead of a flat per-course `files/` directory
-- Export module content as Markdown for easier offline browsing
-- Add selective filters such as term, course code, or include/exclude lists
-- Add integration tests against a mocked Canvas API
-
+Most Canvas instances let users create an access token from the account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`.

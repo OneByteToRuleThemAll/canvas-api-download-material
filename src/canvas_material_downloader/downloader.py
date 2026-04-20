@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 import html
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Callable
 import json
 from urllib.parse import urljoin, urlparse
 
@@ -32,11 +33,26 @@ class CourseSyncSummary:
 
 
 @dataclass(slots=True)
+class SyncProgressEvent:
+    course_id: int
+    course_name: str
+    stage: str
+    action: str
+    current: int | None = None
+    total: int | None = None
+    message: str | None = None
+    summary: CourseSyncSummary | None = None
+
+
+@dataclass(slots=True)
 class AssignmentMaterialSyncResult:
     description_html: str
     material_files: list[dict[str, Any]] = field(default_factory=list)
     downloaded_count: int = 0
     error_count: int = 0
+
+
+ProgressCallback = Callable[[SyncProgressEvent], None]
 
 
 class CanvasMaterialDownloader:
@@ -54,6 +70,7 @@ class CanvasMaterialDownloader:
         include_assignments: bool = True,
         include_files: bool = True,
         include_modules: bool = True,
+        progress_callback: ProgressCallback | None = None,
     ) -> CourseSyncSummary:
         try:
             course = self.client.get_course(course_id)
@@ -65,11 +82,29 @@ class CanvasMaterialDownloader:
             if course is None:
                 raise
 
+        return self.sync_course_record(
+            course,
+            include_assignments=include_assignments,
+            include_files=include_files,
+            include_modules=include_modules,
+            progress_callback=progress_callback,
+        )
+
+    def sync_course_record(
+        self,
+        course: dict[str, Any],
+        *,
+        include_assignments: bool = True,
+        include_files: bool = True,
+        include_modules: bool = True,
+        progress_callback: ProgressCallback | None = None,
+    ) -> CourseSyncSummary:
         return self._sync_course_record(
             course,
             include_assignments=include_assignments,
             include_files=include_files,
             include_modules=include_modules,
+            progress_callback=progress_callback,
         )
 
     def sync_all_courses(
@@ -79,18 +114,81 @@ class CanvasMaterialDownloader:
         include_assignments: bool = True,
         include_files: bool = True,
         include_modules: bool = True,
+        parallelism: int = 1,
+        progress_callback: ProgressCallback | None = None,
     ) -> list[CourseSyncSummary]:
-        summaries: list[CourseSyncSummary] = []
-        for course in self.list_courses(include_concluded=include_concluded):
-            summaries.append(
-                self._sync_course_record(
+        courses = self.list_courses(include_concluded=include_concluded)
+        total_courses = len(courses)
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=0,
+                course_name="All Courses",
+                stage="courses",
+                action="planned",
+                current=0,
+                total=total_courses,
+            ),
+        )
+
+        if parallelism <= 1 or total_courses <= 1:
+            summaries: list[CourseSyncSummary] = []
+            for index, course in enumerate(courses, start=1):
+                summary = self.sync_course_record(
                     course,
                     include_assignments=include_assignments,
                     include_files=include_files,
                     include_modules=include_modules,
                 )
-            )
-        return summaries
+                summaries.append(summary)
+                _emit_progress(
+                    progress_callback,
+                    SyncProgressEvent(
+                        course_id=summary.course_id,
+                        course_name=summary.course_name,
+                        stage="courses",
+                        action="advanced",
+                        current=index,
+                        total=total_courses,
+                        summary=summary,
+                    ),
+                )
+            return summaries
+
+        summaries_by_index: list[CourseSyncSummary | None] = [None] * total_courses
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            future_to_index = {
+                executor.submit(
+                    self.sync_course_record,
+                    course,
+                    include_assignments=include_assignments,
+                    include_files=include_files,
+                    include_modules=include_modules,
+                ): index
+                for index, course in enumerate(courses)
+            }
+
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                summary = future.result()
+                summaries_by_index[index] = summary
+                completed += 1
+                _emit_progress(
+                    progress_callback,
+                    SyncProgressEvent(
+                        course_id=summary.course_id,
+                        course_name=summary.course_name,
+                        stage="courses",
+                        action="advanced",
+                        current=completed,
+                        total=total_courses,
+                        summary=summary,
+                    ),
+                )
+
+        return [summary for summary in summaries_by_index if summary is not None]
 
     def _find_visible_course(self, course_id: int) -> dict[str, Any] | None:
         for include_concluded in (False, True):
@@ -106,6 +204,7 @@ class CanvasMaterialDownloader:
         include_assignments: bool,
         include_files: bool,
         include_modules: bool,
+        progress_callback: ProgressCallback | None = None,
     ) -> CourseSyncSummary:
         course_id = int(course["id"])
         course_name = str(course.get("name") or f"Course {course_id}")
@@ -120,8 +219,26 @@ class CanvasMaterialDownloader:
             course_dir=course_root,
         )
         modules: list[dict[str, Any]] | None = None
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=course_id,
+                course_name=course_name,
+                stage="course",
+                action="started",
+            ),
+        )
 
         if include_modules:
+            _emit_progress(
+                progress_callback,
+                SyncProgressEvent(
+                    course_id=course_id,
+                    course_name=course_name,
+                    stage="modules",
+                    action="started",
+                ),
+            )
             try:
                 modules = self.client.list_course_modules(course_id)
                 summary.modules_total = len(modules)
@@ -147,12 +264,45 @@ class CanvasMaterialDownloader:
                         "error": str(exc),
                     },
                 )
+            finally:
+                _emit_progress(
+                    progress_callback,
+                    SyncProgressEvent(
+                        course_id=course_id,
+                        course_name=course_name,
+                        stage="modules",
+                        action="finished",
+                        total=summary.modules_total,
+                    ),
+                )
 
         if include_assignments:
-            summary = self._sync_course_assignments(course_id, course_root, summary)
+            summary = self._sync_course_assignments(
+                course_id,
+                course_root,
+                summary,
+                progress_callback=progress_callback,
+            )
 
         if include_files:
-            summary = self._sync_course_files(course_id, course_root, summary, modules=modules)
+            summary = self._sync_course_files(
+                course_id,
+                course_root,
+                summary,
+                modules=modules,
+                progress_callback=progress_callback,
+            )
+
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=course_id,
+                course_name=course_name,
+                stage="course",
+                action="finished",
+                summary=summary,
+            ),
+        )
 
         return summary
 
@@ -161,6 +311,8 @@ class CanvasMaterialDownloader:
         course_id: int,
         course_root: Path,
         summary: CourseSyncSummary,
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> CourseSyncSummary:
         try:
             assignments = self.client.list_course_assignments(course_id)
@@ -182,9 +334,21 @@ class CanvasMaterialDownloader:
 
         assignments_dir = course_root / "assignments"
         assignments_dir.mkdir(parents=True, exist_ok=True)
+        total_assignments = len(assignments)
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=summary.course_id,
+                course_name=summary.course_name,
+                stage="assignments",
+                action="planned",
+                current=0,
+                total=total_assignments,
+            ),
+        )
 
         manifest_entries: list[dict[str, Any]] = []
-        for assignment in assignments:
+        for index, assignment in enumerate(assignments, start=1):
             material_result = self._sync_assignment_materials(assignment, assignments_dir=assignments_dir)
             rendered_assignment = dict(assignment)
             rendered_assignment["description"] = material_result.description_html
@@ -203,6 +367,17 @@ class CanvasMaterialDownloader:
             )
             summary.assignment_materials_downloaded += material_result.downloaded_count
             summary.assignment_material_errors += material_result.error_count
+            _emit_progress(
+                progress_callback,
+                SyncProgressEvent(
+                    course_id=summary.course_id,
+                    course_name=summary.course_name,
+                    stage="assignments",
+                    action="advanced",
+                    current=index,
+                    total=total_assignments,
+                ),
+            )
 
         summary.assignments_total = len(assignments)
         _write_json(
@@ -214,6 +389,17 @@ class CanvasMaterialDownloader:
                 "source": "course_assignments",
             },
         )
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=summary.course_id,
+                course_name=summary.course_name,
+                stage="assignments",
+                action="finished",
+                current=total_assignments,
+                total=total_assignments,
+            ),
+        )
         return summary
 
     def _sync_course_files(
@@ -223,6 +409,7 @@ class CanvasMaterialDownloader:
         summary: CourseSyncSummary,
         *,
         modules: list[dict[str, Any]] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> CourseSyncSummary:
         file_source = "course_files"
         warning: str | None = None
@@ -252,11 +439,23 @@ class CanvasMaterialDownloader:
 
         files_dir = course_root / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
+        total_files = len(files)
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=summary.course_id,
+                course_name=summary.course_name,
+                stage="files",
+                action="planned",
+                current=0,
+                total=total_files,
+            ),
+        )
 
         existing_manifest = _load_existing_file_manifest(course_root / "files.json")
         manifest_entries: list[dict[str, Any]] = []
 
-        for file_data in files:
+        for index, file_data in enumerate(files, start=1):
             file_id = int(file_data["id"])
             file_name = file_destination_name(file_data)
             destination = files_dir / file_name
@@ -317,6 +516,17 @@ class CanvasMaterialDownloader:
                     error=error,
                 )
             )
+            _emit_progress(
+                progress_callback,
+                SyncProgressEvent(
+                    course_id=summary.course_id,
+                    course_name=summary.course_name,
+                    stage="files",
+                    action="advanced",
+                    current=index,
+                    total=total_files,
+                ),
+            )
 
         summary.files_total = len(files)
         payload: dict[str, Any] = {
@@ -330,6 +540,17 @@ class CanvasMaterialDownloader:
         _write_json(
             course_root / "files.json",
             payload,
+        )
+        _emit_progress(
+            progress_callback,
+            SyncProgressEvent(
+                course_id=summary.course_id,
+                course_name=summary.course_name,
+                stage="files",
+                action="finished",
+                current=total_files,
+                total=total_files,
+            ),
         )
         return summary
 
@@ -694,3 +915,11 @@ def _replace_url_variants(raw_html: str, variants: set[str], replacement: str) -
         updated_html = updated_html.replace(variant, replacement)
         updated_html = updated_html.replace(html.escape(variant, quote=True), replacement)
     return updated_html
+
+
+def _emit_progress(
+    progress_callback: ProgressCallback | None,
+    event: SyncProgressEvent,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(event)

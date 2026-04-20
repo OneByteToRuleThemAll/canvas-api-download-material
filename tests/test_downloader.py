@@ -1,14 +1,16 @@
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from canvas_material_downloader.canvas_api import CanvasApiError
 from canvas_material_downloader.config import Settings
-from canvas_material_downloader.downloader import CanvasMaterialDownloader
+from canvas_material_downloader.downloader import CanvasMaterialDownloader, CourseSyncSummary
 
 
 class CanvasMaterialDownloaderTests(unittest.TestCase):
@@ -104,6 +106,57 @@ class CanvasMaterialDownloaderTests(unittest.TestCase):
             manifest = (output_root / "assignments.json").read_text(encoding="utf-8")
             self.assertIn('"material_files"', manifest)
             self.assertIn('"local_path": "materials/501/17766 - usernames_passwords.csv"', manifest)
+
+    def test_sync_course_emits_progress_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloader = CanvasMaterialDownloader(_settings(temp_dir))
+            downloader.client = ModuleFallbackClient()
+            events = []
+
+            downloader.sync_course(
+                333,
+                include_assignments=False,
+                progress_callback=events.append,
+            )
+
+            self.assertEqual(events[0].stage, "course")
+            self.assertEqual(events[0].action, "started")
+            self.assertTrue(any(event.stage == "modules" and event.action == "finished" for event in events))
+            self.assertTrue(any(event.stage == "files" and event.action == "planned" and event.total == 2 for event in events))
+            self.assertTrue(any(event.stage == "files" and event.action == "advanced" and event.current == 2 for event in events))
+            self.assertEqual(events[-1].stage, "course")
+            self.assertEqual(events[-1].action, "finished")
+
+    def test_sync_all_courses_parallel_preserves_input_order_and_reports_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloader = CanvasMaterialDownloader(_settings(temp_dir))
+            courses = [
+                {"id": 101, "course_code": "A", "name": "Course A"},
+                {"id": 202, "course_code": "B", "name": "Course B"},
+            ]
+            events = []
+
+            def fake_sync_course_record(course, **_kwargs):
+                if course["id"] == 101:
+                    time.sleep(0.05)
+                else:
+                    time.sleep(0.01)
+                return CourseSyncSummary(
+                    course_id=int(course["id"]),
+                    course_name=str(course["name"]),
+                    course_dir=Path(temp_dir) / str(course["id"]),
+                )
+
+            with mock.patch.object(downloader, "list_courses", return_value=courses):
+                with mock.patch.object(downloader, "sync_course_record", side_effect=fake_sync_course_record):
+                    summaries = downloader.sync_all_courses(parallelism=2, progress_callback=events.append)
+
+            self.assertEqual([summary.course_id for summary in summaries], [101, 202])
+            self.assertEqual(events[0].stage, "courses")
+            self.assertEqual(events[0].action, "planned")
+            advanced_events = [event for event in events if event.stage == "courses" and event.action == "advanced"]
+            self.assertEqual(len(advanced_events), 2)
+            self.assertEqual(advanced_events[-1].current, 2)
 
 
 class ForbiddenGetCourseClient:

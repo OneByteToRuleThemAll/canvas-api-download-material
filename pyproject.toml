@@ -9,7 +9,7 @@ description = "CLI foundation for downloading course material from Canvas."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "matty" }]
-dependencies = []
+dependencies = ["tqdm>=4.66,<5"]
 
 [project.scripts]
 canvas-material = "canvas_material_downloader.cli:main"
@@ -19,4 +19,3 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

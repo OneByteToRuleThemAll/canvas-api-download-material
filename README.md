@@ -8,6 +8,7 @@ The project is built around the Canvas REST API and is meant to be a practical f
 
 - List the Canvas courses available to the authenticated user
 - Sync one course or all visible courses
+- Run `sync-all` in parallel with live course progress output
 - Save per-course metadata as `course.json`, `modules.json`, `assignments.json`, and `files.json`
 - Export each assignment to a local HTML file
 - Download Canvas-hosted files linked inside assignment descriptions when they are still accessible
@@ -94,6 +95,12 @@ Sync every available course:
 python -m canvas_material_downloader sync-all
 ```
 
+Control how many courses run in parallel:
+
+```powershell
+python -m canvas_material_downloader sync-all --parallelism 6
+```
+
 Include concluded courses:
 
 ```powershell
@@ -120,7 +127,8 @@ canvas-material sync-course 12345
 - `files.json` may come either from the course files endpoint or from the module-file fallback path.
 - `assignments.json` may contain assignment metadata even when the linked materials are no longer downloadable.
 - Exported assignment HTML is mainly an offline snapshot of the assignment instructions plus any local rewrites for Canvas-hosted file links that were successfully downloaded.
+- `sync-all` shows a live overall progress bar and prints each course summary as it completes.
 
 ## Canvas token note
 
-Most Canvas instances let users create an access token from the account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`.
+Most Canvas instances let users create an access token from the account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`. A .env.emaple is included, if for example you are a student of OPIT, then you would use `CANVAS_BASE_URL=https://opit.instructure.com`

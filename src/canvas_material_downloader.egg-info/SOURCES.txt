@@ -11,5 +11,7 @@ src/canvas_material_downloader.egg-info/PKG-INFO
 src/canvas_material_downloader.egg-info/SOURCES.txt
 src/canvas_material_downloader.egg-info/dependency_links.txt
 src/canvas_material_downloader.egg-info/entry_points.txt
+src/canvas_material_downloader.egg-info/requires.txt
 src/canvas_material_downloader.egg-info/top_level.txt
+tests/test_downloader.py
 tests/test_fs_utils.py
