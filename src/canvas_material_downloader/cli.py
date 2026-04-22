@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
+import threading
 from typing import Sequence
 
 from .canvas_api import CanvasApiError
@@ -38,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_course.add_argument("course_id", type=int, help="Canvas course ID.")
     sync_course.add_argument("--skip-assignments", action="store_true", help="Do not fetch course assignments.")
     sync_course.add_argument("--skip-files", action="store_true", help="Do not download course files.")
+    sync_course.add_argument("--skip-videos", action="store_true", help="Do not download course videos.")
     sync_course.add_argument("--skip-modules", action="store_true", help="Do not fetch module metadata.")
 
     sync_all = subparsers.add_parser("sync-all", help="Download metadata, assignments, and files for all visible courses.")
@@ -54,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_all.add_argument("--skip-assignments", action="store_true", help="Do not fetch course assignments.")
     sync_all.add_argument("--skip-files", action="store_true", help="Do not download course files.")
+    sync_all.add_argument("--skip-videos", action="store_true", help="Do not download course videos.")
     sync_all.add_argument("--skip-modules", action="store_true", help="Do not fetch module metadata.")
 
     return parser
@@ -77,6 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.course_id,
                     include_assignments=not args.skip_assignments,
                     include_files=not args.skip_files,
+                    include_videos=not args.skip_videos,
                     include_modules=not args.skip_modules,
                     progress_callback=progress_renderer.handle,
                 )
@@ -92,6 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_concluded=args.include_concluded,
                     include_assignments=not args.skip_assignments,
                     include_files=not args.skip_files,
+                    include_videos=not args.skip_videos,
                     include_modules=not args.skip_modules,
                     parallelism=args.parallelism,
                     progress_callback=progress_renderer.handle,
@@ -103,6 +109,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         parser.error("Unknown command.")
         return 2
+    except KeyboardInterrupt:
+        print("Interrupted by user.", file=sys.stderr)
+        return 130
     except (CanvasApiError, ConfigError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -134,29 +143,46 @@ def _print_totals(summaries: list[CourseSyncSummary]) -> None:
     total_downloaded = sum(summary.files_downloaded for summary in summaries)
     total_skipped = sum(summary.files_skipped for summary in summaries)
     total_errors = sum(summary.file_errors for summary in summaries)
+    total_videos = sum(summary.videos_total for summary in summaries)
+    total_videos_downloaded = sum(summary.videos_downloaded for summary in summaries)
+    total_videos_skipped = sum(summary.videos_skipped for summary in summaries)
+    total_video_errors = sum(summary.video_errors for summary in summaries)
     total_issues = sum(len(summary.issues) for summary in summaries)
 
-    print(
-        f"Totals -> courses={total_courses}, assignments={total_assignments}, "
-        f"assignment_materials={total_assignment_materials}, files={total_files}, "
-        f"downloaded={total_downloaded}, skipped={total_skipped}, "
-        f"errors={total_errors}, issues={total_issues}"
-    )
+    print()
+    print("Totals")
+    print(f"  courses: {total_courses}")
+    print(f"  assignments: {total_assignments}")
+    print(f"  assignment_materials: {total_assignment_materials}")
+    print(f"  files: {total_files}")
+    print(f"  downloaded: {total_downloaded}")
+    print(f"  skipped: {total_skipped}")
+    print(f"  errors: {total_errors}")
+    print(f"  videos: {total_videos}")
+    print(f"  videos_downloaded: {total_videos_downloaded}")
+    print(f"  videos_skipped: {total_videos_skipped}")
+    print(f"  video_errors: {total_video_errors}")
+    print(f"  issues: {total_issues}")
 
 
 def _format_sync_summary(summary: CourseSyncSummary) -> str:
-    line = (
-        f"[{summary.course_id}] {summary.course_name} -> "
-        f"assignments={summary.assignments_total}, "
-        f"assignment_materials={summary.assignment_materials_downloaded}, "
-        f"downloaded={summary.files_downloaded}, "
-        f"skipped={summary.files_skipped}, "
-        f"errors={summary.file_errors}, "
-        f"modules={summary.modules_total}, "
-        f"path={summary.course_dir}"
+    line = "\n".join(
+        [
+            f"[{summary.course_id}] {summary.course_name}",
+            f"  assignments: {summary.assignments_total}",
+            f"  assignment_materials: {summary.assignment_materials_downloaded}",
+            f"  downloaded: {summary.files_downloaded}",
+            f"  skipped: {summary.files_skipped}",
+            f"  errors: {summary.file_errors}",
+            f"  videos_downloaded: {summary.videos_downloaded}",
+            f"  videos_skipped: {summary.videos_skipped}",
+            f"  video_errors: {summary.video_errors}",
+            f"  modules: {summary.modules_total}",
+            f"  path: {summary.course_dir}",
+        ]
     )
     if summary.issues:
-        line = f"{line}, issues={'; '.join(summary.issues)}"
+        line = f"{line}\n  issues: {'; '.join(summary.issues)}"
     return line
 
 
@@ -185,7 +211,7 @@ class _SingleCourseProgressRenderer:
                 tqdm.write(f"[{event.course_id}] Modules ready: {event.total or 0}", file=sys.stdout)
             return
 
-        if event.stage not in {"assignments", "files"}:
+        if event.stage not in {"assignments", "files", "videos"}:
             return
 
         if event.action == "planned":
@@ -241,11 +267,48 @@ class _BatchCourseProgressRenderer:
     def __init__(self, *, parallelism: int) -> None:
         self._parallelism = parallelism
         self._bar: tqdm | None = None
+        self._lock = threading.Lock()
+        self._course_summaries: list[CourseSyncSummary] = []
+        self._course_bars: dict[int, tqdm] = {}
+        self._course_slots: dict[int, int] = {}
+        self._stage_totals: dict[int, dict[str, int]] = {}
+        self._stage_current: dict[int, dict[str, int]] = {}
+        self._stage_done: dict[int, dict[str, bool]] = {}
+        self._free_slots: list[int] = list(range(1, parallelism + 1))
 
     def handle(self, event: SyncProgressEvent) -> None:
-        if event.stage != "courses":
-            return
+        with self._lock:
+            if event.stage == "courses":
+                self._handle_courses_event(event)
+                return
 
+            if event.stage == "course":
+                self._handle_course_lifecycle_event(event)
+                return
+
+            if event.stage in {"modules", "assignments", "files", "videos"}:
+                self._handle_course_stage_event(event)
+
+    def close(self) -> None:
+        with self._lock:
+            for bar in self._course_bars.values():
+                bar.close()
+            self._course_bars.clear()
+            self._course_slots.clear()
+
+            if self._bar is not None:
+                self._bar.close()
+                self._bar = None
+
+            if self._course_summaries:
+                print()
+                print("Course Summaries")
+                for summary in self._course_summaries:
+                    print()
+                    print(_format_sync_summary(summary))
+                self._course_summaries.clear()
+
+    def _handle_courses_event(self, event: SyncProgressEvent) -> None:
         if event.action == "planned":
             total = event.total or 0
             self._bar = tqdm(
@@ -254,15 +317,168 @@ class _BatchCourseProgressRenderer:
                 unit="course",
                 file=sys.stdout,
                 dynamic_ncols=True,
+                position=0,
             )
             return
 
         if event.action == "advanced" and self._bar is not None:
             self._bar.update(1)
             if event.summary is not None:
-                tqdm.write(_format_sync_summary(event.summary), file=sys.stdout)
+                self._course_summaries.append(event.summary)
 
-    def close(self) -> None:
-        if self._bar is not None:
-            self._bar.close()
-            self._bar = None
+    def _handle_course_lifecycle_event(self, event: SyncProgressEvent) -> None:
+        if event.action == "started":
+            self._start_course_bar(event)
+            return
+
+        if event.action == "finished":
+            self._finish_course_bar(event)
+
+    def _handle_course_stage_event(self, event: SyncProgressEvent) -> None:
+        course_id = event.course_id
+        if course_id <= 0 or course_id not in self._course_bars:
+            return
+
+        if event.stage == "modules":
+            if event.action == "finished":
+                stage_done = self._stage_done.setdefault(course_id, {})
+                stage_done["modules"] = True
+                self._refresh_course_bar(course_id)
+            return
+
+        stage_totals = self._stage_totals.setdefault(course_id, {})
+        stage_current = self._stage_current.setdefault(course_id, {})
+        stage_done = self._stage_done.setdefault(course_id, {})
+
+        if event.action == "planned":
+            stage_totals[event.stage] = max(0, event.total or 0)
+            stage_current[event.stage] = 0
+            stage_done[event.stage] = stage_totals[event.stage] == 0
+            self._refresh_course_bar(course_id)
+            return
+
+        if event.action == "advanced":
+            stage_current[event.stage] = max(0, event.current or 0)
+            self._refresh_course_bar(course_id)
+            return
+
+        if event.action == "finished":
+            total = stage_totals.get(event.stage, max(0, event.total or 0))
+            stage_totals[event.stage] = total
+            stage_current[event.stage] = total
+            stage_done[event.stage] = True
+            self._refresh_course_bar(course_id)
+
+    def _start_course_bar(self, event: SyncProgressEvent) -> None:
+        if event.course_id in self._course_bars:
+            return
+
+        if self._free_slots:
+            slot = self._free_slots.pop(0)
+        else:
+            slot = self._parallelism
+
+        desc = _format_course_progress_label(event.course_id, event.course_name)
+        bar = tqdm(
+            total=100,
+            initial=0,
+            desc=desc,
+            unit="%",
+            leave=False,
+            file=sys.stdout,
+            dynamic_ncols=True,
+            position=slot,
+            ncols=_recommended_progress_width(),
+            bar_format="{desc:<28} {percentage:3.0f}%|{bar:12}| {postfix}",
+        )
+        self._course_bars[event.course_id] = bar
+        self._course_slots[event.course_id] = slot
+        self._stage_totals[event.course_id] = {}
+        self._stage_current[event.course_id] = {}
+        self._stage_done[event.course_id] = {}
+        self._refresh_course_bar(event.course_id)
+
+    def _finish_course_bar(self, event: SyncProgressEvent) -> None:
+        course_id = event.course_id
+        bar = self._course_bars.pop(course_id, None)
+        slot = self._course_slots.pop(course_id, None)
+        if slot is not None and slot not in self._free_slots:
+            self._free_slots.append(slot)
+            self._free_slots.sort()
+
+        if bar is not None:
+            bar.n = 100
+            bar.refresh()
+            bar.close()
+
+        self._stage_totals.pop(course_id, None)
+        self._stage_current.pop(course_id, None)
+        self._stage_done.pop(course_id, None)
+
+    def _refresh_course_bar(self, course_id: int) -> None:
+        bar = self._course_bars.get(course_id)
+        if bar is None:
+            return
+
+        stage_totals = self._stage_totals.get(course_id, {})
+        stage_current = self._stage_current.get(course_id, {})
+        stage_done = self._stage_done.get(course_id, {})
+
+        module_weight = 1
+        content_stages = ["assignments", "files", "videos"]
+        content_total = sum(max(1, stage_totals.get(stage, 0)) for stage in content_stages if stage in stage_totals)
+        total_units = module_weight + content_total
+        if total_units <= 0:
+            total_units = 1
+
+        completed_units = 0
+        completed_units += 1 if stage_done.get("modules") else 0
+        for stage in content_stages:
+            if stage not in stage_totals:
+                continue
+            stage_total = max(1, stage_totals.get(stage, 0))
+            stage_now = min(stage_total, max(0, stage_current.get(stage, 0)))
+            completed_units += stage_now
+
+        percent = int((completed_units / total_units) * 100)
+        percent = max(0, min(99, percent))
+
+        postfix_items: list[str] = []
+        if "files" in stage_totals:
+            postfix_items.append(f"F {stage_current.get('files', 0)}/{stage_totals['files']}")
+        if "videos" in stage_totals:
+            postfix_items.append(f"V {stage_current.get('videos', 0)}/{stage_totals['videos']}")
+        if "assignments" in stage_totals:
+            postfix_items.append(f"A {stage_current.get('assignments', 0)}/{stage_totals['assignments']}")
+        postfix_text = "  ".join(postfix_items) if postfix_items else "starting"
+
+        bar.n = percent
+        bar.set_postfix_str(postfix_text, refresh=False)
+        bar.refresh()
+
+
+def _format_course_progress_label(course_id: int, course_name: str) -> str:
+    short_name = _short_course_name(course_name)
+    return _truncate_label(f"[{course_id}] {short_name}", max_length=28)
+
+
+def _short_course_name(course_name: str) -> str:
+    parts = [part.strip() for part in course_name.split(" - ") if part.strip()]
+    if parts:
+        return parts[-1]
+    return course_name.strip() or "Course"
+
+
+def _truncate_label(value: str, *, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    if max_length <= 3:
+        return value[:max_length]
+    return f"{value[: max_length - 3].rstrip()}..."
+
+
+def _recommended_progress_width() -> int | None:
+    width = shutil.get_terminal_size(fallback=(100, 24)).columns
+    if width < 60:
+        return 60
+    return min(width, 120)

@@ -4,7 +4,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import os
 
-
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
 
@@ -16,6 +15,7 @@ class Settings:
     output_dir: Path
     timeout_seconds: float
     page_size: int
+    excluded_course_ids: frozenset[int] = frozenset()
     user_agent: str = "canvas-material-downloader/0.1.0"
 
     @classmethod
@@ -28,6 +28,7 @@ class Settings:
 
         timeout_raw = os.getenv("CANVAS_TIMEOUT_SECONDS", "60").strip()
         page_size_raw = os.getenv("CANVAS_PAGE_SIZE", "100").strip()
+        excluded_raw = os.getenv("CANVAS_EXCLUDED_COURSE_IDS")
 
         if not base_url:
             raise ConfigError("Missing CANVAS_BASE_URL. Add it to your environment or .env file.")
@@ -49,12 +50,15 @@ class Settings:
         if page_size <= 0:
             raise ConfigError("CANVAS_PAGE_SIZE must be greater than 0.")
 
+        excluded_course_ids = _parse_excluded_course_ids(excluded_raw)
+
         return cls(
             base_url=base_url,
             access_token=access_token,
             output_dir=output_dir,
             timeout_seconds=timeout_seconds,
             page_size=page_size,
+            excluded_course_ids=excluded_course_ids,
         )
 
     def with_overrides(self, *, output_dir: str | Path | None = None) -> "Settings":
@@ -78,4 +82,30 @@ def load_env_file(path: Path) -> None:
 
         if key:
             os.environ.setdefault(key, value)
+
+
+def _parse_excluded_course_ids(raw: str | None) -> frozenset[int]:
+    if raw is None:
+        return frozenset()
+
+    value = raw.strip()
+    if not value:
+        return frozenset()
+
+    ids: set[int] = set()
+    for token in value.replace(";", ",").split(","):
+        item = token.strip()
+        if not item:
+            continue
+        try:
+            parsed = int(item)
+        except ValueError as exc:
+            raise ConfigError(
+                f"CANVAS_EXCLUDED_COURSE_IDS must contain comma-separated integers, got {raw!r}."
+            ) from exc
+        if parsed <= 0:
+            raise ConfigError("CANVAS_EXCLUDED_COURSE_IDS must contain positive integers only.")
+        ids.add(parsed)
+
+    return frozenset(ids)
 
