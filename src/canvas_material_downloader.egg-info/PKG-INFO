@@ -140,4 +140,4 @@ canvas-material sync-course 12345
 
 ## Canvas token note
 
-Most Canvas instances let users create an access token from the account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`.
+Most Canvas instances let users create an access token from the account settings page. Once you have that token, place it in `.env` as `CANVAS_ACCESS_TOKEN`. A `.env.emaple` is included, if for example you are a student of OPIT, then you would use `CANVAS_BASE_URL=https://opit.instructure.com`

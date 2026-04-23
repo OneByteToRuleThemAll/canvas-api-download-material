@@ -53,27 +53,33 @@ def sanitize_segment(value: str | None, fallback: str = "untitled") -> str:
 
 
 def course_directory_name(course: dict[str, Any]) -> str:
-    parts = [
-        str(course.get("id", "course")),
-        course.get("course_code") or "",
-        course.get("name") or "Untitled Course",
-    ]
-    cleaned = [sanitize_segment(part, fallback="course") for part in parts if str(part).strip()]
-    return " - ".join(cleaned)
+    display_name = (
+        course.get("name")
+        or course.get("original_name")
+        or course.get("course_code")
+        or f"course-{course.get('id') or 'unknown'}"
+    )
+    return sanitize_segment(_strip_course_name_prefix(str(display_name)), fallback="course")
 
 
 def file_destination_name(file_data: dict[str, Any]) -> str:
-    file_id = str(file_data.get("id", "file"))
-    display_name = file_data.get("display_name") or file_data.get("filename") or "download"
-    return sanitize_segment(f"{file_id} - {display_name}", fallback=f"{file_id} - download")
+    display_name = str(file_data.get("display_name") or "").strip()
+    filename = str(file_data.get("filename") or "").strip()
+
+    chosen_name = display_name or filename or "download"
+    if display_name and filename:
+        chosen_name = _ensure_suffix(display_name, fallback_name=filename)
+    chosen_name = _strip_leading_numeric_pair_prefix(chosen_name)
+    chosen_name = _strip_leading_slides_prefix(chosen_name)
+
+    return sanitize_segment(chosen_name, fallback="download")
 
 
 def assignment_destination_name(assignment: dict[str, Any]) -> str:
-    assignment_id = str(assignment.get("id", "assignment"))
     assignment_name = assignment.get("name") or "assignment"
     return sanitize_segment(
-        f"{assignment_id} - {assignment_name}.html",
-        fallback=f"{assignment_id} - assignment.html",
+        f"{assignment_name}.html",
+        fallback="assignment.html",
     )
 
 
@@ -92,3 +98,30 @@ def _split_suffix(filename: str) -> tuple[str, str]:
     if not stem or len(suffix) > 10:
         return filename, ""
     return stem, f".{suffix}"
+
+
+def _ensure_suffix(name: str, *, fallback_name: str) -> str:
+    _name_stem, name_suffix = _split_suffix(name)
+    _fallback_stem, fallback_suffix = _split_suffix(fallback_name)
+    if name_suffix or not fallback_suffix:
+        return name
+    return f"{name}{fallback_suffix}"
+
+
+def _strip_leading_numeric_pair_prefix(value: str) -> str:
+    cleaned = re.sub(r"^\s*\d{1,3}_\d{1,3}_+", "", value)
+    return cleaned.strip() or value
+
+
+def _strip_leading_slides_prefix(value: str) -> str:
+    cleaned = re.sub(r"^\s*slides\s*_+\s*", "", value, flags=re.IGNORECASE)
+    return cleaned.strip() or value
+
+
+def _strip_course_name_prefix(value: str) -> str:
+    return re.sub(
+        r"^\s*BSc Shared Courses\s*-\s*Term\s*\d+\s*\(Fast Track\)\s*-\s*",
+        "",
+        value.strip(),
+        flags=re.IGNORECASE,
+    )
